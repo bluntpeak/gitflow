@@ -43,7 +43,7 @@ PREFIX=$(git config --get gitflow.prefix.feature)
 
 usage() {
 	echo "usage: git flow feature [list] [-v]"
-	echo "       git flow feature start [-F] <name> [<base>]"
+	echo "       git flow feature start [-FP] <name> [<base>]"
 	echo "       git flow feature finish [-rFk] <name|nameprefix>"
 	echo "       git flow feature publish <name>"
 	echo "       git flow feature track <name>"
@@ -180,6 +180,41 @@ parse_args() {
 	BRANCH=$PREFIX$NAME
 }
 
+parse_base_name () {
+	# parse options
+	FLAGS "$@" || exit $?
+	eval set -- "${FLAGS_ARGV}"
+
+	if [ $# -eq 1 ]; then
+		if [[ $1 == "-P" ]]; then
+			NAME=""
+			BRANCH=$NAME
+			BASE=$DEVELOP_BRANCH
+		else
+			NAME=$1
+			BRANCH=$PREFIX$NAME
+			BASE=$DEVELOP_BRANCH
+		fi
+	fi
+	if [ $# -eq 2 ]; then
+		if [[ $1 == "-F" || $1 == "-P" ]]; then
+			NAME=$2
+			BRANCH=$PREFIX$NAME
+			BASE=$DEVELOP_BRANCH
+		else
+			NAME=$1
+			BRANCH=$PREFIX$NAME
+			BASE=$2
+		fi
+	fi
+	if [ $# -eq 3 ]; then
+		NAME=$2
+		BRANCH=$PREFIX$NAME
+		BASE=$3
+	fi
+}
+
+
 parse_remote_name() {
 	# parse options
 	FLAGS "$@" || exit $?
@@ -193,12 +228,63 @@ parse_remote_name() {
 
 cmd_start() {
 	DEFINE_boolean fetch false 'fetch from origin before performing local operation' F
-	parse_args "$@"
-	BASE=${2:-$DEVELOP_BRANCH}
-	require_name_arg
+	DEFINE_boolean pivotal false 'pull feature from Pivotal Tracker and update status to started' P
+	parse_base_name "$@"
+
+	if ! flag pivotal; then
+		require_name_arg
+	else
+		BASE=$DEVELOP_BRANCH
+	fi
 
 	# sanity checks
 	require_branch_absent "$BRANCH"
+
+	STORY_ID=""
+	PIVOTAL_API_KEY=""
+	PIVOTAL_PROJECT_ID=""
+
+	if flag pivotal; then
+		if ! gitflow_has_pivotal_configured; then
+			die "Pivotal Tracker is not configued"
+		fi
+
+		PIVOTAL_PROJECT_ID=$(git config --get pivotal.project-id)
+		PIVOTAL_API_KEY=$(git config --get pivotal.api-token)
+		
+		# Pull our next story id
+		# TODO: Allow us to pass a story id or an owner name/initials
+		STORY_ID=$(pivotal_get_story_id "type%3Afeature%20current_state%3Aunstarted")
+		if [ "$STORY_ID" == "" ]; then
+			# If no story is found, ask whether they want to continue on without
+			default_suggestion="N"
+			printf "Could not find an unstarted story to use. Continue without? (Y/N)? [$default_suggestion] "
+			read answer
+			[ "$answer" = "-" ] && prefix= || prefix=${answer:-$default_suggestion}
+			if [[ "$prefix" != "Y" && "$prefix" != "y" ]]; then
+				die "Exiting..."
+			fi
+		else
+			# Grab the story name -- make sure it's what they want
+			STORY_NAME=$(pivotal_get_story_name "$STORY_ID")
+			default_suggestion="Y"
+			printf "Use story #$STORY_ID '$STORY_NAME' (Y/N)? [$default_suggestion] "
+			read answer
+			[ "$answer" = "-" ] && prefix= || prefix=${answer:-$default_suggestion}
+			if [[ "$prefix" == "Y" || "$prefix" == "y" ]]; then
+				# If no branch was given in the command line, then munge one together
+				# Otherwise, just append on our story id
+				if [[ "$BRANCH" == "" ]]; then
+					BRANCH=$(clean_branch_name "$STORY_NAME")
+					BRANCH="feature/$BRANCH-$STORY_ID"
+				else
+					BRANCH="$BRANCH-$STORY_ID"
+				fi
+			else	
+				die "Exiting..."
+			fi
+		fi
+	fi
 
 	# update the local repo with remote changes, if asked
 	if flag fetch; then
@@ -216,9 +302,18 @@ cmd_start() {
 		die "Could not create feature branch '$BRANCH'"
 	fi
 
+	# If we have a valid story id and we've gotten this far, then mark
+	# the story as started
+	if [ "$STORY_ID" != "" ]; then
+		ret=$(curl -o - -sS -H "X-TrackerToken: $PIVOTAL_API_KEY" -X PUT -H "Content-type: application/xml" -d "<story><current_state>started</current_state></story>" "https://www.pivotaltracker.com/services/v3/projects/$PIVOTAL_PROJECT_ID/stories/$STORY_ID")
+	fi
+
 	echo
 	echo "Summary of actions:"
 	echo "- A new branch '$BRANCH' was created, based on '$BASE'"
+	if [ "$STORY_ID" != "" ]; then
+		echo "- Story #$STORY_ID was marked as started in Pivotal Tracker"
+	fi
 	echo "- You are now on branch '$BRANCH'"
 	echo ""
 	echo "Now, start committing on your feature. When done, use:"
@@ -232,7 +327,7 @@ cmd_finish() {
 	DEFINE_boolean rebase false "rebase instead of merge" r
 	DEFINE_boolean keep false "keep branch after performing finish" k
 	parse_args "$@"
-	expand_nameprefix_arg
+	expand_nameprefix_arg_or_current
 
 	# sanity checks
 	require_branch "$BRANCH"
@@ -343,15 +438,34 @@ helper_finish_cleanup() {
 		git push "$ORIGIN" ":refs/heads/$BRANCH"
 	fi
 	
-	
 	if noflag keep; then
 		git branch -d "$BRANCH"
+	fi
+
+	# See if there is a story id in the branch name
+	STORY_ID=""
+	PIVOTAL_API_KEY=""
+	PIVOTAL_PROJECT_ID=""
+	if [[ "$BRANCH" =~ -([0-9]+)$ ]]; then
+		if [[ "${BASH_REMATCH[1]}" != "" ]]; then
+			STORY_ID="${BASH_REMATCH[1]}"
+		fi
+	fi
+
+	# Have one? Ok, let's attempt to set it to deliver
+	if [[ gitflow_has_pivotal_configured && "$STORY_ID" != "" ]]; then
+		PIVOTAL_PROJECT_ID=$(git config --get pivotal.project-id)
+		PIVOTAL_API_KEY=$(git config --get pivotal.api-token)
+		ret=$(curl -o - -sS -H "X-TrackerToken: $PIVOTAL_API_KEY" -X PUT -H "Content-type: application/xml" -d "<story><current_state>finished</current_state></story>" "https://www.pivotaltracker.com/services/v3/projects/$PIVOTAL_PROJECT_ID/stories/$STORY_ID")
 	fi
 
 	echo
 	echo "Summary of actions:"
 	echo "- The feature branch '$BRANCH' was merged into '$DEVELOP_BRANCH'"
 	#echo "- Merge conflicts were resolved"		# TODO: Add this line when it's supported
+	if [[ gitflow_has_pivotal_configured && "$STORY_ID" != "" ]]; then
+		echo "- Story #$STORY_ID was marked as finished in Pivotal Tracker"
+	fi
 	if flag keep; then
 		echo "- Feature branch '$BRANCH' is still available"
 	else
